@@ -1,7 +1,16 @@
+"""
+Copyright (c) 2017 Max deGroot, Ellis Brown
+Released under the MIT license
+https://github.com/amdegroot/ssd.pytorch
+Updated by: Takuya Mouri
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
+# handbook
+# from torch.autograd import Variable
+# handbook
 from layers import *
 from data import voc, coco
 import os
@@ -31,7 +40,10 @@ class SSD(nn.Module):
         self.num_classes = num_classes
         self.cfg = (coco, voc)[num_classes == 21]
         self.priorbox = PriorBox(self.cfg)
-        self.priors = Variable(self.priorbox.forward(), volatile=True)
+        # handbook
+        # self.priors = Variable(self.priorbox.forward(), volatile=True)
+        self.priors = self.priorbox.forward()
+        # handbook
         self.size = size
 
         # SSD network
@@ -39,14 +51,19 @@ class SSD(nn.Module):
         # Layer learns to scale the l2 normalized features from conv4_3
         self.L2Norm = L2Norm(512, 20)
         self.extras = nn.ModuleList(extras)
-
+        # オフセットと確信度のネットワークリスト
         self.loc = nn.ModuleList(head[0])
         self.conf = nn.ModuleList(head[1])
 
+        # demo実行時
         if phase == 'test':
             self.softmax = nn.Softmax(dim=-1)
-            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
+            # PyTorch1.5.0 support new-style autograd function
+            #self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
+            self.detect = Detect()
+            # PyTorch1.5.0 support new-style autograd function
 
+    # 順伝播
     def forward(self, x):
         """Applies network layers and ops on input image(s) x.
 
@@ -73,15 +90,18 @@ class SSD(nn.Module):
         # apply vgg up to conv4_3 relu
         for k in range(23):
             x = self.vgg[k](x)
-
+        # Conv4-3>Reluの計算結果にL2Normを適用しsourcesに追加
         s = self.L2Norm(x)
         sources.append(s)
 
         # apply vgg up to fc7
         for k in range(23, len(self.vgg)):
             x = self.vgg[k](x)
+        # Conv7>Reluの計算結果をsourcesに追加
         sources.append(x)
 
+        # 追加ネットワークにrelu関数を追加し順伝播
+        # 奇数番目の層の計算結果をsourcesに追加
         # apply extra layers and cache source layer outputs
         for k, v in enumerate(self.extras):
             x = F.relu(v(x), inplace=True)
@@ -90,19 +110,25 @@ class SSD(nn.Module):
 
         # apply multibox head to source layers
         for (x, l, c) in zip(sources, self.loc, self.conf):
+            # (バッチサイズ,C,W,H) → (バッチサイズ,W,H,C)にTranspose
             loc.append(l(x).permute(0, 2, 3, 1).contiguous())
             conf.append(c(x).permute(0, 2, 3, 1).contiguous())
 
         loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
+        # demo実行時
         if self.phase == "test":
-            output = self.detect(
+            # PyTorch1.5.0 support new-style autograd function
+            #output = self.detect(
+            output = self.detect.apply(self.num_classes, 0, 200, 0.01, 0.45,
+            # PyTorch1.5.0 support new-style autograd function
                 loc.view(loc.size(0), -1, 4),                   # loc preds
                 self.softmax(conf.view(conf.size(0), -1,
                              self.num_classes)),                # conf preds
                 self.priors.type(type(x.data))                  # default boxes
             )
         else:
+        # train実行時
             output = (
                 loc.view(loc.size(0), -1, 4),
                 conf.view(conf.size(0), -1, self.num_classes),
@@ -123,12 +149,15 @@ class SSD(nn.Module):
 
 # This function is derived from torchvision VGG make_layers()
 # https://github.com/pytorch/vision/blob/master/torchvision/models/vgg.py
+# ベースネットワークのリスト作成
 def vgg(cfg, i, batch_norm=False):
     layers = []
     in_channels = i
     for v in cfg:
+        # プーリング層　300×300　→　150×150
         if v == 'M':
             layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+        # プーリング層で小数点切り上げ　75×75 →　38×38
         elif v == 'C':
             layers += [nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)]
         else:
@@ -146,6 +175,7 @@ def vgg(cfg, i, batch_norm=False):
     return layers
 
 
+# 追加ネットワークのリスト作成
 def add_extras(cfg, i, batch_norm=False):
     # Extra layers added to VGG for feature scaling
     layers = []
@@ -154,6 +184,7 @@ def add_extras(cfg, i, batch_norm=False):
     for k, v in enumerate(cfg):
         if in_channels != 'S':
             if v == 'S':
+                # strideが2
                 layers += [nn.Conv2d(in_channels, cfg[k + 1],
                            kernel_size=(1, 3)[flag], stride=2, padding=1)]
             else:
@@ -162,24 +193,30 @@ def add_extras(cfg, i, batch_norm=False):
         in_channels = v
     return layers
 
-
+# オフセット、確信度のネットワークのリスト作成
 def multibox(vgg, extra_layers, cfg, num_classes):
     loc_layers = []
     conf_layers = []
     vgg_source = [21, -2]
+    # ベースの21のConv4-3と-2(最後から2番目)のConv7を特徴マップのリストに追加
     for k, v in enumerate(vgg_source):
+        # 出力層の数はアスペクト比の数×座標数
         loc_layers += [nn.Conv2d(vgg[v].out_channels,
                                  cfg[k] * 4, kernel_size=3, padding=1)]
+        # 出力層の数はアスペクト比の数×クラス数
         conf_layers += [nn.Conv2d(vgg[v].out_channels,
                         cfg[k] * num_classes, kernel_size=3, padding=1)]
+    # 追加ネットの内、奇数番目の層を特徴マップのリストに追加
     for k, v in enumerate(extra_layers[1::2], 2):
+        # 出力層の数はアスペクト比の数×座標数
         loc_layers += [nn.Conv2d(v.out_channels, cfg[k]
                                  * 4, kernel_size=3, padding=1)]
+        # 出力層の数はアスペクト比の数×クラス数
         conf_layers += [nn.Conv2d(v.out_channels, cfg[k]
                                   * num_classes, kernel_size=3, padding=1)]
     return vgg, extra_layers, (loc_layers, conf_layers)
 
-
+# 数字は入力チャンネル、M,Cはプーリング、Sはstride=2
 base = {
     '300': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'C', 512, 512, 512, 'M',
             512, 512, 512],
@@ -189,12 +226,13 @@ extras = {
     '300': [256, 'S', 512, 128, 'S', 256, 128, 256, 128, 256],
     '512': [],
 }
+# 特徴マップ毎のアスペクト比の数
 mbox = {
     '300': [4, 6, 6, 6, 4, 4],  # number of boxes per feature map location
     '512': [],
 }
 
-
+# ネットワークのリスト作成
 def build_ssd(phase, size=300, num_classes=21):
     if phase != "test" and phase != "train":
         print("ERROR: Phase: " + phase + " not recognized")
@@ -203,6 +241,7 @@ def build_ssd(phase, size=300, num_classes=21):
         print("ERROR: You specified size " + repr(size) + ". However, " +
               "currently only SSD300 (size=300) is supported!")
         return
+    # ベース、追加、オフセット、確信度のネットワークリストはクラスSSDの引数
     base_, extras_, head_ = multibox(vgg(base[str(size)], 3),
                                      add_extras(extras[str(size)], 1024),
                                      mbox[str(size)], num_classes)
